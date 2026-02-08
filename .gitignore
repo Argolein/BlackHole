@@ -1,3 +1,6 @@
 xcuserdata/
 .DS_Store
 *.pkg
+PLANS.md
+Tools/blackholectl
+Tools/build-menubar/

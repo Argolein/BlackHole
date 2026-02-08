@@ -16,6 +16,7 @@
 #include <dispatch/dispatch.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <sys/syslog.h>
 #include <Accelerate/Accelerate.h>
@@ -265,6 +266,9 @@ static Boolean                      gBox_Acquired                       = kBox_A
 static pthread_mutex_t              gDevice_IOMutex                     = PTHREAD_MUTEX_INITIALIZER;
 static Float64                      gDevice_SampleRate                  = 48000.0;
 static Float64                      gDevice_RequestedSampleRate         = 0.0;
+static bool                         gDevice_SampleRateLockEnabled       = false;
+static Float64                      gDevice_SampleRateLockedValue       = 0.0;
+#define                             kSampleRateLockStatePath            "/tmp/blackhole_sample_rate_lock_state"
 static UInt64                       gDevice_IOIsRunning                 = 0;
 static UInt64                       gDevice2_IOIsRunning                = 0;
 static const UInt32                 kDevice_RingBufferSize              = 16384;
@@ -609,6 +613,51 @@ static bool is_valid_sample_rate(Float64 sample_rate)
     return false;
 }
 
+static void refresh_sample_rate_lock_state_from_file_unlocked(void)
+{
+    char buffer[128] = {0};
+    FILE *file = fopen(kSampleRateLockStatePath, "r");
+    if (file == NULL) {
+        gDevice_SampleRateLockEnabled = false;
+        gDevice_SampleRateLockedValue = 0.0;
+        return;
+    }
+
+    size_t bytesRead = fread(buffer, 1, sizeof(buffer) - 1, file);
+    fclose(file);
+    if (bytesRead == 0) {
+        gDevice_SampleRateLockEnabled = false;
+        gDevice_SampleRateLockedValue = 0.0;
+        return;
+    }
+
+    unsigned int lockEnabled = 0;
+    double lockedRate = 0.0;
+    if (sscanf(buffer, "%u %lf", &lockEnabled, &lockedRate) != 2) {
+        gDevice_SampleRateLockEnabled = false;
+        gDevice_SampleRateLockedValue = 0.0;
+        return;
+    }
+
+    gDevice_SampleRateLockEnabled = lockEnabled != 0;
+    gDevice_SampleRateLockedValue = gDevice_SampleRateLockEnabled ? lockedRate : 0.0;
+}
+
+static bool sample_rate_change_is_locked(Float64 requested_rate)
+{
+    refresh_sample_rate_lock_state_from_file_unlocked();
+
+    if (!gDevice_SampleRateLockEnabled) {
+        return false;
+    }
+
+    if (gDevice_SampleRateLockedValue == 0.0) {
+        return false;
+    }
+
+    return requested_rate != gDevice_SampleRateLockedValue;
+}
+
 #pragma mark Factory
 
 void*	BlackHole_Create(CFAllocatorRef inAllocator, CFUUIDRef inRequestedTypeUUID)
@@ -911,6 +960,7 @@ static OSStatus	BlackHole_PerformDeviceConfigurationChange(AudioServerPlugInDriv
         case ChangeAction_SetSampleRate:
             pthread_mutex_lock(&gPlugIn_StateMutex);
             newSampleRate = gDevice_RequestedSampleRate;
+            FailWithAction(sample_rate_change_is_locked(newSampleRate), pthread_mutex_unlock(&gPlugIn_StateMutex); theAnswer = kAudioHardwareIllegalOperationError, Done, "BlackHole_PerformDeviceConfigurationChange: sample rate is locked");
             pthread_mutex_unlock(&gPlugIn_StateMutex);
             FailWithAction(!is_valid_sample_rate(newSampleRate), theAnswer = kAudioHardwareBadObjectError, Done, "BlackHole_PerformDeviceConfigurationChange: bad sample rate");
             
@@ -2256,9 +2306,12 @@ static OSStatus	BlackHole_IsDevicePropertySettable(AudioServerPlugInDriverRef in
 		case kAudioDevicePropertyIcon:
 			*outIsSettable = false;
 			break;
-		
+			
 		case kAudioDevicePropertyNominalSampleRate:
-			*outIsSettable = true;
+            pthread_mutex_lock(&gPlugIn_StateMutex);
+            refresh_sample_rate_lock_state_from_file_unlocked();
+			*outIsSettable = !gDevice_SampleRateLockEnabled;
+            pthread_mutex_unlock(&gPlugIn_StateMutex);
 			break;
 		
 		default:
@@ -2884,6 +2937,7 @@ static OSStatus	BlackHole_SetDevicePropertyData(AudioServerPlugInDriverRef inDri
 			
 			//	make sure that the new value is different than the old value
 			pthread_mutex_lock(&gPlugIn_StateMutex);
+            FailWithAction(sample_rate_change_is_locked(*((const Float64*)inData)), pthread_mutex_unlock(&gPlugIn_StateMutex); theAnswer = kAudioHardwareIllegalOperationError, Done, "BlackHole_SetDevicePropertyData: sample rate is locked");
 			theOldSampleRate = gDevice_SampleRate;
 			gDevice_RequestedSampleRate = *((const Float64*)inData);
 			pthread_mutex_unlock(&gPlugIn_StateMutex);
@@ -2893,7 +2947,7 @@ static OSStatus	BlackHole_SetDevicePropertyData(AudioServerPlugInDriverRef inDri
 				dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{ gPlugIn_Host->RequestDeviceConfigurationChange(gPlugIn_Host, kObjectID_Device, ChangeAction_SetSampleRate, NULL); });
 			}
 			break;
-		
+
 		default:
 			theAnswer = kAudioHardwareUnknownPropertyError;
 			break;
@@ -2980,10 +3034,16 @@ static OSStatus	BlackHole_IsStreamPropertySettable(AudioServerPlugInDriverRef in
 			break;
 		
 		case kAudioStreamPropertyIsActive:
-		case kAudioStreamPropertyVirtualFormat:
-		case kAudioStreamPropertyPhysicalFormat:
 			*outIsSettable = true;
 			break;
+
+            case kAudioStreamPropertyVirtualFormat:
+            case kAudioStreamPropertyPhysicalFormat:
+                pthread_mutex_lock(&gPlugIn_StateMutex);
+                refresh_sample_rate_lock_state_from_file_unlocked();
+                *outIsSettable = !gDevice_SampleRateLockEnabled;
+                pthread_mutex_unlock(&gPlugIn_StateMutex);
+                break;
 		
 		default:
 			theAnswer = kAudioHardwareUnknownPropertyError;
@@ -3297,6 +3357,7 @@ static OSStatus	BlackHole_SetStreamPropertyData(AudioServerPlugInDriverRef inDri
 			
 			//	If we made it this far, the requested format is something we support, so make sure the sample rate is actually different
 			pthread_mutex_lock(&gPlugIn_StateMutex);
+            FailWithAction(sample_rate_change_is_locked(((const AudioStreamBasicDescription*)inData)->mSampleRate), pthread_mutex_unlock(&gPlugIn_StateMutex); theAnswer = kAudioHardwareIllegalOperationError, Done, "BlackHole_SetStreamPropertyData: sample rate is locked");
 			theOldSampleRate = gDevice_SampleRate;
 			gDevice_RequestedSampleRate = ((const AudioStreamBasicDescription*)inData)->mSampleRate;
 			pthread_mutex_unlock(&gPlugIn_StateMutex);

@@ -135,6 +135,38 @@ After building, to install BlackHole:
 1. Copy or move the built `BlackHoleXch.driver` bundle to `/Library/Audio/Plug-Ins/HAL`
 2. Restart CoreAudio using `sudo killall -9 coreaudiod`
 
+### Sample Rate Lock CLI
+
+This repository includes a helper CLI for toggling the driver sample-rate lock:
+
+```bash
+Tools/build_blackholectl.sh
+./Tools/blackholectl lock status
+./Tools/blackholectl lock on
+./Tools/blackholectl lock off
+
+# Alternative (script mode):
+Tools/blackholectl.swift list
+Tools/blackholectl.swift lock status
+Tools/blackholectl.swift lock on
+Tools/blackholectl.swift lock off
+```
+
+Use `--device-uid <uid>` to target a specific BlackHole device when multiple are present.
+The lock state is stored in `/tmp/blackhole_sample_rate_lock_state` and enforced by the driver.
+After installing a newly built driver, restart CoreAudio (`sudo killall -9 coreaudiod`).
+
+### Menu Bar Lock App
+
+Build a lightweight macOS menu bar app with a lock toggle:
+
+```bash
+Tools/build_blackhole_lock_menubar_app.sh
+open Tools/build-menubar/BlackHoleLockMenuBar.app
+```
+
+The app reads and writes the same lock state as `blackholectl`.
+
 ### Customizing BlackHole
 
 The following pre-compiler constants may be used to easily customize a build of BlackHole.
@@ -318,4 +350,3 @@ BlackHole is licensed under GPL-3.0. You can use BlackHole as long as your app i
 A small tool for changing sound volume even for aggregate devices cause native sound volume controller can't change volume of aggregate devices
 ### [BackgroundMusic](https://github.com/kyleneideck/BackgroundMusic)
 Background Music, a macOS audio utility: automatically pause your music, set individual apps' volumes and record system audio.
-
